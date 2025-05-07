@@ -1,151 +1,71 @@
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+import duckdb
+import requests
+from datetime import datetime
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# Load data from OpenSky
+@st.cache_data(ttl=300)
+def fetch_opensky():
+    try:
+        response = requests.get("https://opensky-network.org/api/states/all")
+        data = response.json()
+        columns = [
+            "icao24", "callsign", "origin_country", "time_position", "last_contact",
+            "longitude", "latitude", "baro_altitude", "on_ground", "velocity",
+            "true_track", "vertical_rate", "sensors", "geo_altitude", "squawk",
+            "spi", "position_source"
+        ]
+        df = pd.DataFrame(data["states"], columns=columns)
+        df = df.dropna(subset=["latitude", "longitude"])  # Drop missing coordinates
+        df["timestamp"] = datetime.utcnow()
+        return df
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+        return pd.DataFrame()
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Store data
+def store_in_duckdb(df):
+    con = duckdb.connect("flights.duckdb")
+    con.execute("CREATE TABLE IF NOT EXISTS flights AS SELECT * FROM df LIMIT 0")
+    con.execute("INSERT INTO flights SELECT * FROM df")
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# Title
+st.title("Real-Time Flight Tracker (OpenSky + DuckDB)")
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# Fetch button
+if st.button("Fetch Live Flight Data"):
+    df = fetch_opensky()
+    if not df.empty:
+        store_in_duckdb(df)
+        st.success(f"Fetched and stored {len(df)} records.")
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# Load recent data for display
+con = duckdb.connect("flights.duckdb")
+recent_df = con.execute("SELECT * FROM flights ORDER BY timestamp DESC LIMIT 500").fetchdf()
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+if not recent_df.empty:
+    st.subheader("Filter Flights")
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+    # Filters
+    country = st.selectbox("Origin Country", ["All"] + sorted(recent_df["origin_country"].dropna().unique().tolist()))
+    min_alt = st.slider("Minimum Altitude (m)", 0, 12000, 0)
+    airborne_only = st.checkbox("Airborne Only", value=True)
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+    filtered_df = recent_df.copy()
+    if country != "All":
+        filtered_df = filtered_df[filtered_df["origin_country"] == country]
+    filtered_df = filtered_df[filtered_df["baro_altitude"] >= min_alt]
+    if airborne_only:
+        filtered_df = filtered_df[filtered_df["on_ground"] == False]
 
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    # Map display
+    st.subheader("Flight Map")
+    if not filtered_df.empty:
+        st.map(filtered_df[["latitude", "longitude"]])
+        st.dataframe(filtered_df[["callsign", "origin_country", "latitude", "longitude", "baro_altitude"]])
+    else:
+        st.info("No flights match your filters.")
+else:
+    st.info("No flight data yet. Click 'Fetch Live Flight Data' above.")
+    
